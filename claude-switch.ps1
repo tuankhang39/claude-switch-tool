@@ -20,6 +20,20 @@ function Get-CsEmail([string]$Name) {
     } catch { return "(unreadable)" }
 }
 
+function Get-CsClaude {
+    # Prefer the claude CLI on PATH; fall back to the binary bundled with the VS Code extension
+    $cmd = Get-Command claude -CommandType Application, ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    foreach ($ext in @("$HOME\.vscode\extensions", "$HOME\.vscode-insiders\extensions", "$HOME\.cursor\extensions")) {
+        $exe = Get-ChildItem $ext -Directory -Filter "anthropic.claude-code-*" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            ForEach-Object { Join-Path $_.FullName "resources\native-binary\claude.exe" } |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($exe) { return $exe }
+    }
+    throw "Claude Code not found. Install the CLI (https://docs.anthropic.com/en/docs/claude-code) or the VS Code extension."
+}
+
 function Get-CsNames {
     $names = @("main")
     if (Test-Path $CsRoot) {
@@ -55,9 +69,12 @@ function Sync-CsShared([string]$Name) {
         $src = Join-Path $CsMain $d
         if (Test-Path $src) { Copy-Item $src $dst -Recurse -Force; Write-Host "  + $d\" }
     }
-    # Per-project memory
+    # Per-project memory (skipped when projects\ is a junction to main's: already shared)
     $projSrc = Join-Path $CsMain "projects"
-    if (Test-Path $projSrc) {
+    $projDst = Join-Path $dst "projects"
+    if ((Test-Path $projDst) -and (Get-Item $projDst).LinkType) {
+        Write-Host "  = projects\ shared with main (history + memory)"
+    } elseif (Test-Path $projSrc) {
         Get-ChildItem $projSrc -Directory | ForEach-Object {
             $mem = Join-Path $_.FullName "memory"
             if (Test-Path $mem) {
@@ -68,6 +85,62 @@ function Sync-CsShared([string]$Name) {
             }
         }
     }
+}
+
+$CsEditors = @{
+    cursor = Join-Path $env:APPDATA "Cursor\User\settings.json"
+    code   = Join-Path $env:APPDATA "Code\User\settings.json"
+}
+$CsEnvKeyPattern = '"claudeCode\.environmentVariables"\s*:\s*\[[^\]]*\]\s*,?'
+
+function Get-CsEditorDir([string]$Editor) {
+    # CLAUDE_CONFIG_DIR the editor's Claude Code extension launches with ($null = main)
+    $file = $CsEditors[$Editor]
+    if (-not (Test-Path $file)) { return $null }
+    $m = [regex]::Match((Get-Content $file -Raw), $CsEnvKeyPattern)
+    if (-not $m.Success) { return $null }
+    $v = [regex]::Match($m.Value, '"name"\s*:\s*"CLAUDE_CONFIG_DIR"\s*,\s*"value"\s*:\s*"([^"]*)"')
+    if ($v.Success) { return $v.Groups[1].Value.Replace('\\', '\') }
+    return $null
+}
+
+function Set-CsEditor([string]$Editor, [string]$Name) {
+    # Point the editor's Claude Code extension at an account via claudeCode.environmentVariables.
+    # settings.json is JSONC (comments, trailing commas), so only that one key is rewritten as text.
+    $file = $CsEditors[$Editor]
+    if (-not (Test-Path $file)) {
+        New-Item -ItemType File -Force $file | Out-Null
+        Set-Content $file "{`n}" -NoNewline
+    }
+    $text = Get-Content $file -Raw
+    Copy-Item $file "$file.bak" -Force
+
+    # Keep any other variables already set in the array
+    $others = @()
+    $m = [regex]::Match($text, $CsEnvKeyPattern)
+    if ($m.Success) {
+        $arr = [regex]::Match($m.Value, '\[[^\]]*\]').Value -replace ',(\s*[\]}])', '$1'
+        # PowerShell 5.1 emits a parsed JSON array as one object; enumerate it in a second step
+        try { $parsed = $arr | ConvertFrom-Json; $others = @($parsed | Where-Object { $_.name -ne "CLAUDE_CONFIG_DIR" }) }
+        catch { throw "Could not read claudeCode.environmentVariables in $file. Fix it by hand, then retry." }
+        $text = $text.Remove($m.Index, $m.Length)
+    }
+
+    $vars = @($others | ForEach-Object { @{ name = $_.name; value = $_.value } })
+    if ($Name -ne "main") { $vars += @{ name = "CLAUDE_CONFIG_DIR"; value = (Get-CsDir $Name) } }
+
+    if ($vars.Count -gt 0) {
+        $items = $vars | ForEach-Object {
+            '{{ "name": "{0}", "value": "{1}" }}' -f $_.name, ($_.value -replace '\\', '\\' -replace '"', '\"')
+        }
+        $entry = "`n  `"claudeCode.environmentVariables`": [" + ($items -join ", ") + "],"
+        $brace = $text.IndexOf("{")
+        if ($brace -lt 0) { throw "$file does not look like a settings file." }
+        $text = $text.Insert($brace + 1, $entry)
+    }
+    # Drop blank lines left where the old key was
+    $text = [regex]::Replace($text, '(\r?\n)[ \t]*\r?\n', '$1')
+    [IO.File]::WriteAllText($file, $text, (New-Object Text.UTF8Encoding($false)))
 }
 
 function claude-switch {
@@ -81,11 +154,16 @@ function claude-switch {
         { $_ -in "list", "ls" } {
             $session = Get-CsNameFromDir $env:CLAUDE_CONFIG_DIR
             $default = Get-CsNameFromDir ([Environment]::GetEnvironmentVariable("CLAUDE_CONFIG_DIR", "User"))
+            $inEditor = @{}
+            foreach ($e in $CsEditors.Keys) {
+                if (Test-Path $CsEditors[$e]) { $inEditor[$e] = Get-CsNameFromDir (Get-CsEditorDir $e) }
+            }
             Write-Host ""
             foreach ($n in Get-CsNames) {
                 $marks = @()
                 if ($n -eq $session) { $marks += "active" }
                 if ($n -eq $default) { $marks += "default" }
+                foreach ($e in $inEditor.Keys | Sort-Object) { if ($inEditor[$e] -eq $n) { $marks += $e } }
                 $prefix = if ($n -eq $session) { "*" } else { " " }
                 $tag = if ($marks) { "  [" + ($marks -join ", ") + "]" } else { "" }
                 Write-Host ("{0} {1,-12} {2}{3}" -f $prefix, $n, (Get-CsEmail $n), $tag)
@@ -102,7 +180,7 @@ function claude-switch {
             Sync-CsShared $Name
             Write-Host "`nStarting Claude Code for '$Name' - run /login to sign in to the new account."
             $env:CLAUDE_CONFIG_DIR = $dir
-            claude
+            & (Get-CsClaude)
         }
 
         "use" {
@@ -118,7 +196,7 @@ function claude-switch {
             try {
                 if ($Name -eq "main") { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
                 else { $env:CLAUDE_CONFIG_DIR = Get-CsDir $Name }
-                claude @Rest
+                & (Get-CsClaude) @Rest
             } finally {
                 if ($old) { $env:CLAUDE_CONFIG_DIR = $old } else { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
             }
@@ -131,6 +209,14 @@ function claude-switch {
             if ($val) { $env:CLAUDE_CONFIG_DIR = $val } else { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
             Write-Host "Default account: $Name ($(Get-CsEmail $Name))"
             Write-Host "VS Code: close ALL VS Code windows and reopen for the extension to pick up the new account."
+        }
+
+        { $_ -in "cursor", "code" } {
+            Assert-CsExists $Name
+            Set-CsEditor $Command $Name
+            $app = if ($Command -eq "cursor") { "Cursor" } else { "VS Code" }
+            Write-Host "$app Claude Code extension -> $Name ($(Get-CsEmail $Name))"
+            Write-Host "In $app run 'Developer: Reload Window' (Ctrl+Shift+P) to apply. Backup: $($CsEditors[$Command]).bak"
         }
 
         "sync" {
@@ -153,6 +239,11 @@ function claude-switch {
             if ($env:CLAUDE_CONFIG_DIR -and (Get-CsNameFromDir $env:CLAUDE_CONFIG_DIR) -eq $Name) {
                 Remove-Item Env:CLAUDE_CONFIG_DIR
             }
+            # Windows PowerShell 5.1 Remove-Item -Recurse can follow junctions and delete the
+            # target's files (e.g. main's shared history); unlink junctions with rmdir first.
+            Get-ChildItem $dir -Force -Recurse -Attributes ReparsePoint -ErrorAction SilentlyContinue |
+                Sort-Object { $_.FullName.Length } -Descending |
+                ForEach-Object { cmd /c rmdir "$($_.FullName)" | Out-Null; Write-Host "  unlinked $($_.FullName)" }
             Remove-Item $dir -Recurse -Force
             Write-Host "Removed '$Name'."
         }
@@ -166,6 +257,8 @@ claude-switch - manage multiple Claude Code accounts
   claude-switch add <name>       Create an account, copy config from main, start claude to /login
   claude-switch use <name>       Switch the current terminal to <name>
   claude-switch run <name> [...] Run claude as <name> without switching the terminal
+  claude-switch cursor <name>    Switch the Cursor extension to <name> (then Reload Window)
+  claude-switch code <name>      Switch the VS Code extension to <name> (then Reload Window)
   claude-switch default <name>   Set the default account (also VS Code; reopen VS Code)
   claude-switch sync <name>      Re-copy settings/skills/memory from main to <name>
   claude-switch remove <name>    Delete an account
@@ -179,9 +272,14 @@ claude-switch - manage multiple Claude Code accounts
 
 Set-Alias cs claude-switch
 
+# No claude CLI on PATH: expose the VS Code extension's bundled binary as `claude`
+if (-not (Get-Command claude -CommandType Application, ExternalScript -ErrorAction SilentlyContinue)) {
+    function claude { & (Get-CsClaude) @args }
+}
+
 Register-ArgumentCompleter -CommandName claude-switch, cs -ParameterName Command -ScriptBlock {
     param($cmd, $param, $word)
-    "list", "add", "use", "run", "default", "sync", "remove", "help" | Where-Object { $_ -like "$word*" }
+    "list", "add", "use", "run", "cursor", "code", "default", "sync", "remove", "help" | Where-Object { $_ -like "$word*" }
 }
 Register-ArgumentCompleter -CommandName claude-switch, cs -ParameterName Name -ScriptBlock {
     param($cmd, $param, $word)
