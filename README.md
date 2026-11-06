@@ -13,9 +13,10 @@ cs cursor work      # Cursor now uses your work account (after Reload Window)
 cs cursor main      # back to your personal account
 ```
 
-<!-- Demo GIF goes here: record `cs cursor work` -> Reload Window -> the panel's email changes, save as docs/demo.gif, then uncomment:
-![Switching the Claude Code account in Cursor](docs/demo.gif)
--->
+![Switching the Claude Code account in Cursor with claude-switch](docs/demo.gif)
+
+<!-- docs/demo.gif is rendered by docs/make_demo_gif.py (python docs/make_demo_gif.py docs/demo.gif) -->
+
 
 ## Why
 
