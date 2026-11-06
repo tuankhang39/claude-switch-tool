@@ -1,0 +1,4 @@
+# Never commit Claude login data
+.credentials.json
+.claude.json
+.claude-accounts/
